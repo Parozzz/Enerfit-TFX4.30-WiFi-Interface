@@ -12,12 +12,22 @@
 
 #include <BLETools.h>
 
+#include <Wire.h>
+#include <VL53L1X.h>
+
 #define CMD_OBTAIN_PARAMS 1
 #define CMD_UPDATE 2
 #define CMD_START 3
 #define CMD_STOP 4
 #define CMD_SET_SPEED_SLOPE 5
 
+#define UDP_CMD_START 1
+#define UDP_CMD_STOP 2
+#define UDP_CMD_SET_SPEED 3
+#define UDP_CMD_SET_SLOPE 4
+#define UDP_CMD_SET_DISTANCE 5
+
+#define PRESENCE_DISTANCE_BUFFER_SIZE 30
 #define CMD_FIFO_LEN 5
 #define WIFI_RETRY_TIME_MILLIS 120 * 1000
 
@@ -172,6 +182,7 @@ struct
   uint8_t reserved;
 } udpSendData;
 bool udpExecuteSendData = false;
+bool udpExecuteRefresh = false;
 
 bool udpInitialized = false;
 uint8_t udpBuffer[1024];
@@ -199,12 +210,11 @@ void udp()
     udpNewRecvData = true;
 
     sendDebug->print("UDP - Packet received. [");
-    for(int x = 0; x < packetSize; x++)
+    for (int x = 0; x < packetSize; x++)
     {
       sendDebug->printf("%x, ", udpBuffer[x]);
     }
     sendDebug->println("]");
-
   }
 
   if (udpExecuteSendData)
@@ -222,14 +232,69 @@ void udp()
 
     sendDebug->println("UDP - Packet sent");
   }
+
+  if(udpExecuteRefresh)
+  {
+    udpExecuteRefresh = false;
+
+    UDP.beginPacket(UDP_SEND_HOST, UDP_SEND_PORT);
+    UDP.write('U');
+    UDP.write('P');
+    UDP.endPacket();
+  }
+}
+
+VL53L1X distanceSensor;
+bool distanceSensorOK = false;
+uint16_t presenceDistance = 0; // mm
+
+void distanceSensorInit()
+{
+  distanceSensor.setTimeout(500);
+  distanceSensorOK = distanceSensor.init();
+  if (distanceSensorOK)
+  {
+    distanceSensor.setDistanceMode(VL53L1X::DistanceMode::Long);
+    distanceSensor.setMeasurementTimingBudget(80000);
+    distanceSensor.startContinuous(100);
+  }
+  else
+  {
+    sendDebug->println("Failed to detect and initialize sensor!");
+  }
+}
+
+bool distanceSensorReadPresence()
+{
+  if (distanceSensorOK)
+  {
+    uint16_t distance = distanceSensor.read(false);
+    if (distance)
+    {
+      return distance < presenceDistance;
+    }
+    else if (distanceSensor.timeoutOccurred())
+    {
+      distanceSensorOK = false;
+    }
+  }
+
+  return false;
 }
 
 void setup()
 {
+  udpExecuteRefresh = true;
+  udpExecuteSendData = true; //Send data at startup to avoid mismatch of values
+
   setSerialDebugEFuse();
 
   Serial.begin(115200);  // USB
   Serial0.begin(115200); // UART 0
+
+  Wire.setPins(GPIO_NUM_9, GPIO_NUM_10);
+  Wire.begin();
+  Wire.setClock(100000); // use 100 kHz I2C
 
   ble.init("PAROZZZ");
   ble.setDebugSerial(&Serial);
@@ -244,6 +309,8 @@ void setup()
   sendDebug = &Serial;
 #endif
 
+  distanceSensorInit();
+
   if (wifi())
   {
     otaSetup();
@@ -255,6 +322,8 @@ void setup()
 
 bool continousUpdate = true;
 uint32_t delayBetweenCommands = DELAY_BETWEEN_READING_ON_STOP;
+uint32_t periodicRefreshTimestamp;
+
 void loop()
 {
   if (wifi())
@@ -270,7 +339,6 @@ void loop()
   }
 
   ble.loop();
-
   while (recvDebug->available())
   {
     uint8_t read = recvDebug->read();
@@ -336,26 +404,50 @@ void loop()
     }
   }
 
+  bool presence = distanceSensorReadPresence();
+  if (presence != bitRead(udpSendData.status, 3))
+  {
+    bitWrite(udpSendData.status, 3, presence);
+    udpExecuteSendData = true;
+
+    sendDebug->printf("Presence changed %s\n", presence ? "ON" : "OFF");
+  }
+
+  if(statusData.status == THINKFIT_STATUS_STANDBY)
+  {
+    if(millis() - periodicRefreshTimestamp > 10800000) //About 3h
+    {
+      periodicRefreshTimestamp = millis();
+      udpExecuteRefresh = true;
+    }
+  }
+  else
+  {
+    periodicRefreshTimestamp = millis();
+  }
+
   if (udpNewRecvData)
   {
     udpNewRecvData = false;
 
     switch (udpRecvData.command)
     {
-    case 1:
+    case UDP_CMD_START:
       thinkfitCommandsFifo.insert(CMD_START);
       break;
-    case 2:
+    case UDP_CMD_STOP:
       thinkfitCommandsFifo.insert(CMD_STOP);
       break;
-    case 3:
+    case UDP_CMD_SET_SPEED:
       speedSlopeData.speed = udpRecvData.data;
       thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
       break;
-    case 4:
+    case UDP_CMD_SET_SLOPE:
       speedSlopeData.slope = udpRecvData.data;
       thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
       break;
+    case UDP_CMD_SET_DISTANCE:
+      presenceDistance = udpRecvData.data * 10;
     }
   }
 
