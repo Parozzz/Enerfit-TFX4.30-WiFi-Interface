@@ -95,14 +95,16 @@ void thinkfitInit(Stream *pDeviceStream)
         ->addData("Time", 2)     // Seconds
         ->addData("Distance", 2) // mm
         ->addData("Calorie", 2)
-        ->addData("Reservation", 4);
+        ->addData("Reservation", 2)
+        ->addData("Heartbeat", 2);
     THINKFIT_RECV_OBTAIN_STATUS_STOPPING
         .addData("Speed", 1)
         ->addData("Slope", 1)
         ->addData("Time", 2)     // Seconds
         ->addData("Distance", 2) // mm
         ->addData("Calorie", 2)
-        ->addData("Reservation", 4);
+        ->addData("Reservation", 2)
+        ->addData("Heartbeat", 2);
     THINKFIT_RECV_OBTAIN_STATUS_MALFUNCTION
         .addData("Code", 1);
 

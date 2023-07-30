@@ -32,7 +32,7 @@
 #define WIFI_RETRY_TIME_MILLIS 120 * 1000
 
 #define DELAY_BETWEEN_READING_ON_START 250
-#define DELAY_BETWEEN_READING_ON_STOP 1500
+#define DELAY_BETWEEN_READING_ON_STOP 1100
 
 #define DEBUG_WITH_BLE
 
@@ -177,6 +177,7 @@ struct
   uint16_t currentTime;     //[s]
   uint16_t currentDistance; //[mm]
   uint16_t currentCalorie;  //[0.1 Kj]
+  uint16_t currentHeartbeat;
 
   uint8_t malfunctionCode;
   uint8_t reserved;
@@ -233,7 +234,7 @@ void udp()
     sendDebug->println("UDP - Packet sent");
   }
 
-  if(udpExecuteRefresh)
+  if (udpExecuteRefresh)
   {
     udpExecuteRefresh = false;
 
@@ -285,7 +286,7 @@ bool distanceSensorReadPresence()
 void setup()
 {
   udpExecuteRefresh = true;
-  udpExecuteSendData = true; //Send data at startup to avoid mismatch of values
+  udpExecuteSendData = true; // Send data at startup to avoid mismatch of values
 
   setSerialDebugEFuse();
 
@@ -323,6 +324,8 @@ void setup()
 bool continousUpdate = true;
 uint32_t delayBetweenCommands = DELAY_BETWEEN_READING_ON_STOP;
 uint32_t periodicRefreshTimestamp;
+
+uint8_t oldStatus;
 
 void loop()
 {
@@ -413,9 +416,9 @@ void loop()
     sendDebug->printf("Presence changed %s\n", presence ? "ON" : "OFF");
   }
 
-  if(statusData.status == THINKFIT_STATUS_STANDBY)
+  if (statusData.status == THINKFIT_STATUS_STANDBY)
   {
-    if(millis() - periodicRefreshTimestamp > 10800000) //About 3h
+    if (millis() - periodicRefreshTimestamp > 10800000) // About 3h
     {
       periodicRefreshTimestamp = millis();
       udpExecuteRefresh = true;
@@ -467,30 +470,46 @@ void loop()
     result = thinkfitCommStatus(&statusData);
     if (result > 0)
     {
-      if (statusData.status == THINKFIT_STATUS_STARTING || statusData.status == THINKFIT_STATUS_RUNNING)
+      bool enableUpdate = true;
+      switch (statusData.status)
       {
+      case THINKFIT_STATUS_STARTING:
+      case THINKFIT_STATUS_RUNNING:
+      case THINKFIT_STATUS_STOPPING:
         delayBetweenCommands = DELAY_BETWEEN_READING_ON_START;
-      }
-      else
-      {
+        break;
+      default:
         delayBetweenCommands = DELAY_BETWEEN_READING_ON_STOP;
+        //Only update after the treadmill went into the standby mode or if he changes mode for wathever reason.
+        if (oldStatus == statusData.status)
+        {
+          enableUpdate = false;
+        }
+
+        break;
       }
 
-      //(b0 = starting, b1=running, b2=stopping, b3=presence detected)
-      bitWrite(udpSendData.status, 0, statusData.status == THINKFIT_STATUS_STARTING);
-      bitWrite(udpSendData.status, 1, statusData.status == THINKFIT_STATUS_RUNNING);
-      bitWrite(udpSendData.status, 2, statusData.status == THINKFIT_STATUS_STOPPING);
+      oldStatus = statusData.status;
 
-      udpSendData.currentSpeed = statusData.currentSpeed;
-      udpSendData.currentSlope = statusData.currentSlope;
-      udpSendData.currentTime = statusData.currentTime;
-      udpSendData.currentDistance = statusData.currentDistance;
-      udpSendData.currentCalorie = statusData.currentCalorie;
+      if (enableUpdate)
+      {
+        //(b0 = starting, b1=running, b2=stopping, b3=presence detected)
+        bitWrite(udpSendData.status, 0, statusData.status == THINKFIT_STATUS_STARTING);
+        bitWrite(udpSendData.status, 1, statusData.status == THINKFIT_STATUS_RUNNING);
+        bitWrite(udpSendData.status, 2, statusData.status == THINKFIT_STATUS_STOPPING);
 
-      udpSendData.malfunctionCode = statusData.mulfunctionCode;
-      udpSendData.countdown = statusData.startCountdown;
+        udpSendData.currentSpeed = statusData.currentSpeed;
+        udpSendData.currentSlope = statusData.currentSlope;
+        udpSendData.currentTime = statusData.currentTime;
+        udpSendData.currentDistance = statusData.currentDistance;
+        udpSendData.currentCalorie = statusData.currentCalorie;
+        udpSendData.currentHeartbeat = statusData.currentHeartbeat;
 
-      udpExecuteSendData = true;
+        udpSendData.malfunctionCode = statusData.mulfunctionCode;
+        udpSendData.countdown = statusData.startCountdown;
+
+        udpExecuteSendData = true;
+      }
     }
 
     if (result)

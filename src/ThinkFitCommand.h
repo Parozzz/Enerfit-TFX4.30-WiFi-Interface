@@ -269,6 +269,7 @@ struct ThinkfitStatusData
     uint16_t currentTime;     // Seconds
     uint16_t currentDistance; // mm
     uint16_t currentCalorie;  // 0.1 Kj
+    uint16_t currentHeartbeat;
 
     uint8_t mulfunctionCode;
 
@@ -294,6 +295,7 @@ struct ThinkfitStatusData
                 currentTime = command->getDataValueFor("Time");
                 currentDistance = command->getDataValueFor("Distance");
                 currentCalorie = command->getDataValueFor("Calorie");
+                currentHeartbeat = command->getDataValueFor("Heartbeat");
                 break;
             case THINKFIT_STATUS_MALFUNCTION:
                 mulfunctionCode = command->getDataValueFor("Code");
