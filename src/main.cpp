@@ -7,6 +7,9 @@
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
 #include <FIFO.h>
+#include <UDPJsonMessages.h>
+#include <cJSON.h>
+#include <cJSON_Utils.h>
 
 #include <ThinkFitCommand.h>
 
@@ -31,8 +34,8 @@
 #define CMD_FIFO_LEN 5
 #define WIFI_RETRY_TIME_MILLIS 120 * 1000
 
-#define DELAY_BETWEEN_READING_ON_START 250
-#define DELAY_BETWEEN_READING_ON_STOP 1100
+#define DELAY_BETWEEN_READING_ON_START 500
+#define DELAY_BETWEEN_READING_ON_STOP 1250
 
 #define DEBUG_WITH_BLE
 
@@ -53,7 +56,7 @@ uint8_t thinkfitCommand;
 uint8_t fifoBuffer[CMD_FIFO_LEN];
 FIFO<uint8_t> thinkfitCommandsFifo(fifoBuffer, CMD_FIFO_LEN);
 
-uint32_t lastCmdTimestamp = 0;
+bool debug = false;
 
 bool otaUpdating = false;
 void otaSetup()
@@ -159,36 +162,14 @@ bool wifi()
   return connected;
 }
 
-struct
-{
-  uint8_t command; // 1 = CMD START, 2 = CMD STOP, 3=SET SPEED, 4 = SET SLOPE
-  uint8_t data;
-} udpRecvData;
-bool udpNewRecvData = false;
+size_t udpRecvSize;
+uint8_t udpRecvBuffer[4096];
+size_t udpSendSize;
+uint8_t udpSendBuffer[4096];
 
-struct
-{
-  uint8_t status; //(b0 = starting, b1=running, b2=stopping, b3=presence detected)
-
-  uint8_t currentSpeed; //[0.1Km/h]
-  uint8_t currentSlope; //[°]
-  uint8_t countdown;
-
-  uint16_t currentTime;     //[s]
-  uint16_t currentDistance; //[mm]
-  uint16_t currentCalorie;  //[0.1 Kj]
-  uint16_t currentHeartbeat;
-
-  uint8_t malfunctionCode;
-  uint8_t reserved;
-} udpSendData;
-bool udpExecuteSendData = false;
-bool udpExecuteRefresh = false;
-
-bool udpInitialized = false;
-uint8_t udpBuffer[1024];
 void udp()
 {
+  static bool udpInitialized = false;
   if (!udpInitialized)
   {
     udpInitialized = true;
@@ -197,98 +178,102 @@ void udp()
     UDP.setTimeout(1000);
   }
 
-  int packetSize = UDP.parsePacket();
-  if (packetSize)
+  udpRecvSize = UDP.parsePacket();
+  if (udpRecvSize)
   {
-    UDP.read(udpBuffer, packetSize);
-    if (packetSize < sizeof(udpRecvData))
-    {
-      sendDebug->printf("UDP - Invalid size. Recv: %d, Expected: %d\n", packetSize, sizeof(udpRecvData));
-      return;
-    }
+    UDP.read(udpRecvBuffer, udpRecvSize);
 
-    memcpy(&udpRecvData, udpBuffer, sizeof(udpRecvData));
-    udpNewRecvData = true;
-
-    sendDebug->print("UDP - Packet received. [");
-    for (int x = 0; x < packetSize; x++)
+    sendDebug->printf("UDP - Packet received. Size= %d\n", udpRecvSize);
+    if (debug)
     {
-      sendDebug->printf("%x, ", udpBuffer[x]);
+      for (int x = 0; x < udpRecvSize; x++)
+      {
+        sendDebug->write(udpRecvBuffer[x]);
+      }
+      sendDebug->println();
     }
-    sendDebug->println("]");
   }
 
-  if (udpExecuteSendData)
+  if (udpSendSize)
   {
-    udpExecuteSendData = false;
-
-    uint8_t *pSend = (uint8_t *)&udpSendData;
-
     UDP.beginPacket(UDP_SEND_HOST, UDP_SEND_PORT);
-    for (int x = 0; x < sizeof(udpSendData); x++)
+    for (int x = 0; x < udpSendSize; x++)
     {
-      UDP.write(pSend[x]);
+      UDP.write(udpSendBuffer[x]);
     }
     UDP.endPacket();
 
-    sendDebug->println("UDP - Packet sent");
-  }
+    sendDebug->printf("UDP - Packet sent. Size= %d \n", udpSendSize);
+    if (debug)
+    {
+      for (int x = 0; x < udpSendSize; x++)
+      {
+        sendDebug->write(udpSendBuffer[x]);
+      }
+      sendDebug->println();
+    }
 
-  if (udpExecuteRefresh)
-  {
-    udpExecuteRefresh = false;
-
-    UDP.beginPacket(UDP_SEND_HOST, UDP_SEND_PORT);
-    UDP.write('U');
-    UDP.write('P');
-    UDP.endPacket();
+    udpSendSize = 0;
   }
 }
 
 VL53L1X distanceSensor;
-bool distanceSensorOK = false;
-uint16_t presenceDistance = 0; // mm
-
-void distanceSensorInit()
+uint16_t distanceSensorRead()
 {
-  distanceSensor.setTimeout(500);
-  distanceSensorOK = distanceSensor.init();
-  if (distanceSensorOK)
-  {
-    distanceSensor.setDistanceMode(VL53L1X::DistanceMode::Long);
-    distanceSensor.setMeasurementTimingBudget(80000);
-    distanceSensor.startContinuous(100);
-  }
-  else
-  {
-    sendDebug->println("Failed to detect and initialize sensor!");
-  }
-}
+  static bool distanceSensorInitOK = false;
+  static uint32_t timeoutTimestamp = 0;
 
-bool distanceSensorReadPresence()
-{
-  if (distanceSensorOK)
+  if (distanceSensorInitOK)
   {
+    distanceSensor.readSingle(false);
+
+    timeoutTimestamp = millis();
+    while (!distanceSensor.dataReady())
+    {
+      yield();
+      if (millis() - timeoutTimestamp > 30)
+      {
+        distanceSensorInitOK = false;
+
+        sendDebug->println("VL53L1X - Sensor timeout.");
+        return 0;
+      }
+      delay(1);
+    }
+
     uint16_t distance = distanceSensor.read(false);
-    if (distance)
+    return distance;
+  }
+
+  static uint32_t lastInitTimestamp = 0;
+  // Only try to init senza when treadmill is not running, so i avoid not so cool stuff.
+  if (statusData.status == THINKFIT_STATUS_STANDBY && (lastInitTimestamp == 0 || millis() - lastInitTimestamp > 1000))
+  {
+    lastInitTimestamp = millis();
+
+    distanceSensor.setTimeout(100);
+    distanceSensorInitOK = distanceSensor.init();
+    if (distanceSensorInitOK)
     {
-      return distance < presenceDistance;
+      // distanceSensor.setDistanceMode(VL53L1X::DistanceMode::Long); By default is set to long. No need to do it double.
+      distanceSensor.setMeasurementTimingBudget(10000);
+      // distanceSensor.startContinuous(100);
+
+      sendDebug->println("VL53L1X - Sensor initialized.");
     }
-    else if (distanceSensor.timeoutOccurred())
+    else
     {
-      distanceSensorOK = false;
+      sendDebug->println("DISTANCE - Sensor initialize fail.");
     }
   }
 
-  return false;
+  return 0;
 }
 
 void setup()
 {
-  udpExecuteRefresh = true;
-  udpExecuteSendData = true; // Send data at startup to avoid mismatch of values
-
   setSerialDebugEFuse();
+  udpSendSize = fillJSONUpdateRequest(udpSendBuffer); // At startup, request parameters to PC.
 
   Serial.begin(115200);  // USB
   Serial0.begin(115200); // UART 0
@@ -310,8 +295,6 @@ void setup()
   sendDebug = &Serial;
 #endif
 
-  distanceSensorInit();
-
   if (wifi())
   {
     otaSetup();
@@ -323,24 +306,40 @@ void setup()
 
 bool continousUpdate = true;
 uint32_t delayBetweenCommands = DELAY_BETWEEN_READING_ON_STOP;
-uint32_t periodicRefreshTimestamp;
 
-uint8_t oldStatus;
+uint16_t paramPresenceDistance = 0; // mm
 
 void loop()
 {
+#pragma region WIFI UDP OTA
   if (wifi())
   {
+    static bool oldOtaUpdating = false;
+
     ArduinoOTA.handle();
     if (otaUpdating)
     {
-      ble.stopAdvertising();
+
+      if (!oldOtaUpdating)
+      {
+        oldOtaUpdating = true;
+        ble.stopAdvertising();
+      }
+
       return;
+    }
+
+    if (oldOtaUpdating)
+    {
+      oldOtaUpdating = false;
+      ESP.restart();
+      delay(1000000);
     }
 
     udp();
   }
-
+#pragma endregion
+#pragma region BLE DEBUG SERIAL RECEIVE
   ble.loop();
   while (recvDebug->available())
   {
@@ -371,11 +370,13 @@ void loop()
         break;
       case 'E':
       case 'e':
+        debug = true;
         sendDebug->println("THINKFIT - Enable debug.");
         thinkfitSetDebugStream(sendDebug);
         break;
       case 'D':
       case 'd':
+        debug = false;
         sendDebug->println("THINKFIT - Disable debug.");
         thinkfitSetDebugStream(nullptr);
         break;
@@ -392,7 +393,94 @@ void loop()
       }
     }
   }
+#pragma endregion
+#pragma region UDP JSON PARSING
+  if (udpRecvSize)
+  {
+    cJSON *json = cJSON_ParseWithLength((const char *)udpRecvBuffer, udpRecvSize);
+    udpRecvSize = 0;
 
+    if (cJSON_HasObjectItem(json, "Speed"))
+    {
+      speedSlopeData.speed = cJSON_GetNumberValue(cJSON_GetObjectItem(json, "Speed"));
+      thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
+
+      if (debug)
+        sendDebug->printf("UDP - Received Speed= %d\n", speedSlopeData.speed);
+    }
+
+    if (cJSON_HasObjectItem(json, "Slope"))
+    {
+      speedSlopeData.slope = cJSON_GetNumberValue(cJSON_GetObjectItem(json, "Slope"));
+      thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
+
+      if (debug)
+        sendDebug->printf("UDP - Received Slope= %d\n", speedSlopeData.slope);
+    }
+
+    if (cJSON_HasObjectItem(json, "Start"))
+    {
+      cJSON_bool start = cJSON_IsTrue(cJSON_GetObjectItem(json, "Start"));
+      thinkfitCommandsFifo.insert(start ? CMD_START : CMD_STOP);
+
+      if (debug)
+        sendDebug->printf("UDP - Received Start= %d\n", start);
+    }
+
+    if (cJSON_HasObjectItem(json, "SetDistance"))
+    {
+      double distance = cJSON_GetNumberValue(cJSON_GetObjectItem(json, "SetDistance"));
+      paramPresenceDistance = distance * 10;
+
+      if (debug)
+        sendDebug->printf("UDP - Received SetDistance= %d\n", distance);
+    }
+
+    cJSON_Delete(json);
+  }
+#pragma endregion
+
+  static bool presence = false;
+  static bool oldPresence = false;
+  static bool presenceUpdateReq = false;
+/*
+  This is not the best for a single core CPU. It needs a separated core to handle all the stuff that can happen (Like disconnections and re-init)
+#pragma region SENSOR DISTANCE
+  // Do it while we don't have a command active. Since is blocking, it might interfere with the thinkfit stuff and cause problems.
+  if (!thinkfitCommand)
+  {
+
+    static uint32_t distanceReadTimestamp = 0;
+    if (distanceReadTimestamp == 0 || (millis() - distanceReadTimestamp) > 2000)
+    {
+      distanceReadTimestamp = millis();
+
+      uint16_t distance = distanceSensorRead();
+      if (distance)
+      {
+        if (debug)
+          sendDebug->printf("DISTANCE - Read %d[mm]\n", distance);
+
+        presence = distance < paramPresenceDistance;
+        if (presence != oldPresence)
+        {
+          presenceUpdateReq = true;
+          sendDebug->printf("DISTANCE - Presence %s\n", presence ? "ON" : "OFF");
+        }
+        oldPresence = presence;
+      }
+    }
+  }
+#pragma endregion
+*/
+  thinkfitLoop(); // Its place is important. Don't move it!
+
+#pragma region THINKFIT COMMANDS
+
+  // This get the first output commando inside the commands fifo.
+  // If it does not find anything (So thinkfitCommand is not populated),
+  // it will set it as a update command (If enabled) so thinkfit library read the status of the treadmill.-
+  static uint32_t lastCmdTimestamp = 0;
   if (!thinkfitCommand && (millis() - lastCmdTimestamp) > delayBetweenCommands)
   {
     thinkfitCommand = thinkfitCommandsFifo.get();
@@ -407,56 +495,7 @@ void loop()
     }
   }
 
-  bool presence = distanceSensorReadPresence();
-  if (presence != bitRead(udpSendData.status, 3))
-  {
-    bitWrite(udpSendData.status, 3, presence);
-    udpExecuteSendData = true;
-
-    sendDebug->printf("Presence changed %s\n", presence ? "ON" : "OFF");
-  }
-
-  if (statusData.status == THINKFIT_STATUS_STANDBY)
-  {
-    if (millis() - periodicRefreshTimestamp > 10800000) // About 3h
-    {
-      periodicRefreshTimestamp = millis();
-      udpExecuteRefresh = true;
-    }
-  }
-  else
-  {
-    periodicRefreshTimestamp = millis();
-  }
-
-  if (udpNewRecvData)
-  {
-    udpNewRecvData = false;
-
-    switch (udpRecvData.command)
-    {
-    case UDP_CMD_START:
-      thinkfitCommandsFifo.insert(CMD_START);
-      break;
-    case UDP_CMD_STOP:
-      thinkfitCommandsFifo.insert(CMD_STOP);
-      break;
-    case UDP_CMD_SET_SPEED:
-      speedSlopeData.speed = udpRecvData.data;
-      thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
-      break;
-    case UDP_CMD_SET_SLOPE:
-      speedSlopeData.slope = udpRecvData.data;
-      thinkfitCommandsFifo.insert(CMD_SET_SPEED_SLOPE);
-      break;
-    case UDP_CMD_SET_DISTANCE:
-      presenceDistance = udpRecvData.data * 10;
-    }
-  }
-
   int8_t result = 0;
-
-  thinkfitLoop();
   switch (thinkfitCommand)
   {
   case CMD_OBTAIN_PARAMS:
@@ -470,50 +509,30 @@ void loop()
     result = thinkfitCommStatus(&statusData);
     if (result > 0)
     {
-      bool enableUpdate = true;
+      static uint8_t oldStatus = 0xFF; // Set to invalid value so the first loop after boot it will update the PC
+
       switch (statusData.status)
       {
       case THINKFIT_STATUS_STARTING:
       case THINKFIT_STATUS_RUNNING:
       case THINKFIT_STATUS_STOPPING:
         delayBetweenCommands = DELAY_BETWEEN_READING_ON_START;
+        udpSendSize = fillJSONStatusData(udpSendBuffer, &statusData, presence);
         break;
       default:
         delayBetweenCommands = DELAY_BETWEEN_READING_ON_STOP;
-        //Only update after the treadmill went into the standby mode or if he changes mode for wathever reason.
-        if (oldStatus == statusData.status)
-        {
-          enableUpdate = false;
+        if (oldStatus != statusData.status || presenceUpdateReq)
+        { // Only update after the treadmill went into the standby mode or if he changes mode for wathever reason.
+          udpSendSize = fillJSONStatusData(udpSendBuffer, &statusData, presence);
         }
-
         break;
       }
-
       oldStatus = statusData.status;
-
-      if (enableUpdate)
-      {
-        //(b0 = starting, b1=running, b2=stopping, b3=presence detected)
-        bitWrite(udpSendData.status, 0, statusData.status == THINKFIT_STATUS_STARTING);
-        bitWrite(udpSendData.status, 1, statusData.status == THINKFIT_STATUS_RUNNING);
-        bitWrite(udpSendData.status, 2, statusData.status == THINKFIT_STATUS_STOPPING);
-
-        udpSendData.currentSpeed = statusData.currentSpeed;
-        udpSendData.currentSlope = statusData.currentSlope;
-        udpSendData.currentTime = statusData.currentTime;
-        udpSendData.currentDistance = statusData.currentDistance;
-        udpSendData.currentCalorie = statusData.currentCalorie;
-        udpSendData.currentHeartbeat = statusData.currentHeartbeat;
-
-        udpSendData.malfunctionCode = statusData.mulfunctionCode;
-        udpSendData.countdown = statusData.startCountdown;
-
-        udpExecuteSendData = true;
-      }
     }
 
     if (result)
     {
+      presenceUpdateReq = false;
       sendDebug->println("THINKFIT - STATUS DONE");
     }
     break;
@@ -554,6 +573,5 @@ void loop()
       sendDebug->println(thinkfitGetErrorText(result));
     }
   }
-
-  // put your main code here, to run repeatedly:
+#pragma endregion
 }
