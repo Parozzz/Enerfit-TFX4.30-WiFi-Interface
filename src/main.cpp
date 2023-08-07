@@ -32,7 +32,6 @@
 
 #define PRESENCE_DISTANCE_BUFFER_SIZE 30
 #define CMD_FIFO_LEN 5
-#define WIFI_RETRY_TIME_MILLIS 120 * 1000
 
 #define DELAY_BETWEEN_READING_ON_START 500
 #define DELAY_BETWEEN_READING_ON_STOP 1250
@@ -59,33 +58,33 @@ FIFO<uint8_t> thinkfitCommandsFifo(fifoBuffer, CMD_FIFO_LEN);
 bool debug = false;
 
 bool otaUpdating = false;
-void otaSetup()
+void ota()
 {
-  ArduinoOTA.setHostname("EnerfitTreadmill");
+  static bool otaConfigured = false;
+  if (!otaConfigured)
+  {
+    otaConfigured = true;
+    ArduinoOTA.setHostname("EnerfitTreadmill");
+    ArduinoOTA.setRebootOnSuccess(true);
 
-  ArduinoOTA.onStart([]()
-                     {
-    String type;
-
-    if (ArduinoOTA.getCommand() == U_FLASH)
-      type = "sketch";
-    else
-      type = "filesystem"; // U_FS
+    ArduinoOTA.onStart([]()
+                       {
+    String type = ArduinoOTA.getCommand() == U_FLASH ? "sketch" : "filesystem"; // U_FS;
     // NOTE: if updating FS this would be the place to unmount FS using FS.end()
 
     Serial.println("Start updating " + type); 
     otaUpdating = true; });
 
-  ArduinoOTA.onEnd([]()
-                   { 
+    ArduinoOTA.onEnd([]()
+                     { 
                      Serial.println("\nOTA End"); 
                      otaUpdating = false; });
 
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-                        { Serial.printf("Progress: %u%% \n", (progress / (total / 100))); });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+                          { Serial.printf("Progress: %u%% \n", (progress / (total / 100))); });
 
-  ArduinoOTA.onError([](ota_error_t error)
-                     {
+    ArduinoOTA.onError([](ota_error_t error)
+                       {
                         otaUpdating = false;
                         Serial.printf("Error[%u]: ", error);
                         switch(error)
@@ -107,7 +106,10 @@ void otaSetup()
                           break;
                         } });
 
-  ArduinoOTA.begin();
+    ArduinoOTA.begin();
+  }
+
+  ArduinoOTA.handle();
 }
 
 /*
@@ -134,31 +136,53 @@ void setSerialDebugEFuse()
 bool wasConnected = false;
 bool wifi()
 {
-  if (WiFi.waitForConnectResult() == WL_CONNECTED)
+  static bool wifiConfigured = false;
+  if (!wifiConfigured)
   {
-    return true;
+    wifiConfigured = true;
+
+    WiFi.setHostname("ThinkfitWIFI");
+    WiFi.config(IP_ADDRESS, GATEWAY, SUBNET);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    WiFi.setAutoReconnect(true);
+    WiFi.enableLongRange(true);
+    WiFi.setTxPower(wifi_power_t::WIFI_POWER_19_5dBm);
   }
 
-  // WiFi.setTxPower(wifi_power_t::WIFI_POWER_19_5dBm);
-  WiFi.config(IP_ADDRESS, GATEWAY, SUBNET);
-  WiFi.enableSTA(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  static bool oldConnected = false;
+  bool connected = WiFi.isConnected();
 
-  uint32_t lastTryTimestamp = millis();
-  while (WiFi.waitForConnectResult() != WL_CONNECTED && (millis() - lastTryTimestamp) < WIFI_RETRY_TIME_MILLIS)
+  if (debug)
   {
-    yield();
+    static uint32_t timestampWifiDebugInfo = 0;
+    if (timestampWifiDebugInfo == 0 || (millis() - timestampWifiDebugInfo) > 15000)
+    {
+      timestampWifiDebugInfo = millis();
+
+      String localIPString = WiFi.localIP().toString();
+      String mask = WiFi.subnetMask().toString();
+      sendDebug->printf("WiFi connection status= %s, RSSI= %d dBm, IP=%s, SubnetMask=%s, Channel=%d \n",
+                        connected ? "CONNECTED" : "DISCONNECTED",
+                        WiFi.RSSI(),
+                        localIPString.c_str(),
+                        mask.c_str(),
+                        WiFi.channel());
+      localIPString = mask = "";
+    }
   }
 
-  bool connected = WiFi.waitForConnectResult() == WL_CONNECTED;
-  sendDebug->printf("WiFi connection status= %d, MAC= %x:%x:%x:%x:%x:%x\n",
-                    connected,
-                    WiFi.macAddress()[0],
-                    WiFi.macAddress()[1],
-                    WiFi.macAddress()[2],
-                    WiFi.macAddress()[3],
-                    WiFi.macAddress()[4],
-                    WiFi.macAddress()[5]);
+  if (connected != oldConnected)
+  {
+    oldConnected = connected;
+    sendDebug->printf("WiFi connected. MAC= %x:%x:%x:%x:%x:%x\n",
+                      WiFi.macAddress()[0],
+                      WiFi.macAddress()[1],
+                      WiFi.macAddress()[2],
+                      WiFi.macAddress()[3],
+                      WiFi.macAddress()[4],
+                      WiFi.macAddress()[5]);
+  }
   return connected;
 }
 
@@ -295,11 +319,6 @@ void setup()
   sendDebug = &Serial;
 #endif
 
-  if (wifi())
-  {
-    otaSetup();
-  }
-
   thinkfitInit(&Serial0);
   sendDebug->println("THINKFIT INIT - DONE");
 }
@@ -314,26 +333,19 @@ void loop()
 #pragma region WIFI UDP OTA
   if (wifi())
   {
-    static bool oldOtaUpdating = false;
-
-    ArduinoOTA.handle();
+    ota();
     if (otaUpdating)
     {
-
+      static bool oldOtaUpdating = false;
       if (!oldOtaUpdating)
       {
         oldOtaUpdating = true;
+        
         ble.stopAdvertising();
+        UDP.stop();
       }
 
       return;
-    }
-
-    if (oldOtaUpdating)
-    {
-      oldOtaUpdating = false;
-      ESP.restart();
-      delay(1000000);
     }
 
     udp();
@@ -341,6 +353,12 @@ void loop()
 #pragma endregion
 #pragma region BLE DEBUG SERIAL RECEIVE
   ble.loop();
+
+  if (!ble.connected)
+  {
+    debug = false;
+  }
+
   while (recvDebug->available())
   {
     uint8_t read = recvDebug->read();
@@ -371,24 +389,36 @@ void loop()
       case 'E':
       case 'e':
         debug = true;
-        sendDebug->println("THINKFIT - Enable debug.");
+        sendDebug->println("Enable debug.");
         thinkfitSetDebugStream(sendDebug);
         break;
       case 'D':
       case 'd':
         debug = false;
-        sendDebug->println("THINKFIT - Disable debug.");
+        sendDebug->println("Disable debug.");
         thinkfitSetDebugStream(nullptr);
         break;
       case 'S':
       case 's':
-        sendDebug->println("THINKFIT - STOP CONTINOUS UPDATE");
+        sendDebug->println("STOP CONTINOUS UPDATE");
         continousUpdate = false;
         break;
       case 'C':
       case 'c':
-        sendDebug->println("THINKFIT - STARTED CONTINOUS UPDATE");
+        sendDebug->println("STARTED CONTINOUS UPDATE");
         continousUpdate = true;
+        break;
+      case 'R':
+      case 'r':
+        sendDebug->println("Restart");
+        delay(10);
+
+        ESP.restart();
+        break;
+      case 'W':
+      case 'w':
+        sendDebug->println("Reconnect WiFi");
+        WiFi.reconnect();
         break;
       }
     }
@@ -443,36 +473,36 @@ void loop()
   static bool presence = false;
   static bool oldPresence = false;
   static bool presenceUpdateReq = false;
-/*
-  This is not the best for a single core CPU. It needs a separated core to handle all the stuff that can happen (Like disconnections and re-init)
-#pragma region SENSOR DISTANCE
-  // Do it while we don't have a command active. Since is blocking, it might interfere with the thinkfit stuff and cause problems.
-  if (!thinkfitCommand)
-  {
-
-    static uint32_t distanceReadTimestamp = 0;
-    if (distanceReadTimestamp == 0 || (millis() - distanceReadTimestamp) > 2000)
+  /*
+    This is not the best for a single core CPU. It needs a separated core to handle all the stuff that can happen (Like disconnections and re-init)
+  #pragma region SENSOR DISTANCE
+    // Do it while we don't have a command active. Since is blocking, it might interfere with the thinkfit stuff and cause problems.
+    if (!thinkfitCommand)
     {
-      distanceReadTimestamp = millis();
 
-      uint16_t distance = distanceSensorRead();
-      if (distance)
+      static uint32_t distanceReadTimestamp = 0;
+      if (distanceReadTimestamp == 0 || (millis() - distanceReadTimestamp) > 2000)
       {
-        if (debug)
-          sendDebug->printf("DISTANCE - Read %d[mm]\n", distance);
+        distanceReadTimestamp = millis();
 
-        presence = distance < paramPresenceDistance;
-        if (presence != oldPresence)
+        uint16_t distance = distanceSensorRead();
+        if (distance)
         {
-          presenceUpdateReq = true;
-          sendDebug->printf("DISTANCE - Presence %s\n", presence ? "ON" : "OFF");
+          if (debug)
+            sendDebug->printf("DISTANCE - Read %d[mm]\n", distance);
+
+          presence = distance < paramPresenceDistance;
+          if (presence != oldPresence)
+          {
+            presenceUpdateReq = true;
+            sendDebug->printf("DISTANCE - Presence %s\n", presence ? "ON" : "OFF");
+          }
+          oldPresence = presence;
         }
-        oldPresence = presence;
       }
     }
-  }
-#pragma endregion
-*/
+  #pragma endregion
+  */
   thinkfitLoop(); // Its place is important. Don't move it!
 
 #pragma region THINKFIT COMMANDS
